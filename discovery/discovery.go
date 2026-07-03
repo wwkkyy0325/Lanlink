@@ -262,6 +262,13 @@ func (s *Service) staleCleanupLoop() {
 	}
 }
 
+// GetLocalIP returns the best LAN IPv4 address, preferring physical
+// interfaces over VPN / virtual adapters. Exported so identity can
+// use the same selection for MAC matching.
+func GetLocalIP() string {
+	return getLocalIP()
+}
+
 func getLocalIP() string {
 	// Prefer the best LAN IP from a physical interface.
 	// The old Dial("udp", "8.8.8.8:80") trick picks whichever interface

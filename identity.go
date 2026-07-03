@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"lanlink/discovery"
 	"lanlink/models"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -119,20 +120,28 @@ func (a *App) loadOrCreateIdentity() {
 	}
 }
 
-// getPrimaryMAC returns the MAC address of the primary physical network interface.
-// Skips loopback, virtual, and down interfaces. Returns "aa:bb:cc:dd:ee:ff" format.
+// getPrimaryMAC returns the MAC address of the best physical network interface.
+// Fallback chain:
+//  1. Match the LAN IP (from discovery.GetLocalIP) to its interface MAC
+//  2. Pick the first non-loopback, non-virtual interface with a valid MAC
+//  3. Use hostname as a stable ID
+//  4. Last resort: random hex
 func getPrimaryMAC() string {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	// Heuristic: prefer the interface whose IP matches our primary LAN IP
 	primaryIP := getLocalIPForMAC()
 
-	var best string
-	var bestScore int = -1
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fallbackMAC()
+	}
 
+	// Pass 1: exact IP match
+	if primaryIP != "" {
+		if mac := findMACByIP(interfaces, primaryIP); mac != "" {
+			return mac
+		}
+	}
+
+	// Pass 2: first non-virtual interface with a valid MAC
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -141,92 +150,49 @@ func getPrimaryMAC() string {
 		if hw == "" || len(iface.HardwareAddr) < 6 {
 			continue
 		}
-
-		score := 0
-		// Skip common virtual adapter name prefixes
-		name := strings.ToLower(iface.Name)
-		for _, v := range []string{"vmware", "virtualbox", "vbox", "vpn", "tap", "tunnel", "pseudo", "docker", "wsl", "hyper-v", "bluetooth", "utun", "vmnet", "bridge", "gif", "stf", "awdl", "llw", "veth", "virbr", "tap", "tun"} {
-			if strings.Contains(name, v) {
-				score -= 10
-			}
+		if isVirtualAdapterName(iface.Name) {
+			continue
 		}
-
-		// Strongly prefer the interface that owns our LAN IP
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				if ipnet.IP.String() == primaryIP {
-					score += 100
-				} else if !ipnet.IP.IsLoopback() {
-					score += 5
-				}
-			}
-		}
-
-		if score > bestScore {
-			bestScore = score
-			best = hw
-		}
+		return hw
 	}
-	return best
+
+	return fallbackMAC()
 }
 
-func getLocalIPForMAC() string {
-	// Prefer a real LAN IP over VPN virtual IPs for MAC matching.
-	if ip := pickBestLANIP(); ip != "" {
-		return ip
-	}
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
+func findMACByIP(interfaces []net.Interface, targetIP string) string {
+	ip := net.ParseIP(targetIP)
+	if ip == nil {
 		return ""
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
-}
-
-// pickBestLANIP returns the best LAN IPv4 address, skipping VPN/virtual adapters.
-func pickBestLANIP() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-	var best string
-	bestScore := -1
-	for _, iface := range ifaces {
+	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		name := strings.ToLower(iface.Name)
-		if isVirtual(name) {
+		hw := iface.HardwareAddr.String()
+		if hw == "" || len(iface.HardwareAddr) < 6 {
 			continue
 		}
 		addrs, _ := iface.Addrs()
 		for _, a := range addrs {
-			ipnet, ok := a.(*net.IPNet)
-			if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLoopback() {
-				continue
-			}
-			ip4 := ipnet.IP.To4()
-			score := 0
-			if ip4[0] == 192 && ip4[1] == 168 {
-				score = 100
-			} else if ip4[0] == 10 {
-				score = 90
-			} else if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
-				score = 80
-			} else if ip4[0] == 169 && ip4[1] == 254 {
-				score = -50
-			}
-			if score > bestScore {
-				bestScore = score
-				best = ip4.String()
+			if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.Equal(ip) {
+				return hw
 			}
 		}
 	}
-	return best
+	return ""
 }
 
-func isVirtual(name string) bool {
+// fallbackMAC returns a stable fallback when no physical MAC is available.
+// Prefers hostname (stable across restarts) over random hex.
+func fallbackMAC() string {
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return "host:" + host
+	}
+	return "rnd:" + generateFallbackID()
+}
+
+func isVirtualAdapterName(name string) bool {
+	n := strings.ToLower(name)
 	for _, kw := range []string{
 		"vmware", "virtualbox", "vbox", "vpn", "tap", "tunnel",
 		"pseudo", "docker", "wsl", "hyper-v", "bluetooth",
@@ -234,12 +200,17 @@ func isVirtual(name string) bool {
 		"veth", "virbr", "tun", "radmin", "wireguard", "wg",
 		"zerotier", "zt", "tailscale", "ts", "hamachi",
 		"ppp", "pptp", "l2tp", "sstp", "openvpn", "nordlynx",
+		"loopback", "software loopback",
 	} {
-		if strings.Contains(name, kw) {
+		if strings.Contains(n, kw) {
 			return true
 		}
 	}
 	return false
+}
+
+func getLocalIPForMAC() string {
+	return discovery.GetLocalIP()
 }
 
 func generateFallbackID() string {
