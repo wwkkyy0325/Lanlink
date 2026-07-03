@@ -3,6 +3,9 @@ export namespace main {
 	export class AppSettings {
 	    downloadDir: string;
 	    askSaveLocation: boolean;
+	    customRelays: string[];
+	    useDoH: boolean;
+	    transportMode: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppSettings(source);
@@ -12,6 +15,9 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.downloadDir = source["downloadDir"];
 	        this.askSaveLocation = source["askSaveLocation"];
+	        this.customRelays = source["customRelays"];
+	        this.useDoH = source["useDoH"];
+	        this.transportMode = source["transportMode"];
 	    }
 	}
 	export class PairedPeer {
@@ -43,6 +49,7 @@ export namespace models {
 	    online: boolean;
 	    source: string;
 	    groups: string[];
+	    p2pId?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Device(source);
@@ -58,6 +65,7 @@ export namespace models {
 	        this.online = source["online"];
 	        this.source = source["source"];
 	        this.groups = source["groups"];
+	        this.p2pId = source["p2pId"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

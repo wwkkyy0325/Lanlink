@@ -5,9 +5,11 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,6 +50,7 @@ type Node struct {
 	mu    sync.RWMutex
 	peers map[peer.ID]*PeerState
 	ps    *nodePubSub
+	customRelays []string
 
 	// NAT info (populated by AutoNAT)
 	natInfo NatInfo
@@ -76,14 +79,87 @@ type NatInfo struct {
 	RelayAddrs   int    `json:"relayAddrs"`
 }
 
-// NewNode creates a libp2p Node with full NAT traversal stack:
+// SetCustomRelays updates the relay list (called after settings load)
+func (n *Node) SetCustomRelays(relays []string) {
+	n.mu.Lock()
+	n.customRelays = relays
+	n.mu.Unlock()
+}
+
+// allRelays returns public + custom relays
+func (n *Node) allRelays() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	result := make([]string, 0, len(publicRelays)+len(n.customRelays))
+	result = append(result, publicRelays...)
+	result = append(result, n.customRelays...)
+	return result
+}
+
+// resolveDoH tries to resolve relay domains via DNS-over-HTTPS to bypass GFW pollution.
+// Returns IP-replaced multiaddrs if successful, original addrs otherwise.
+func resolveDoH(relayAddrs []string) []string {
+	var resolved []string
+	for _, addr := range relayAddrs {
+		// Check if addr contains /dns4/ that needs resolution
+		if !strings.Contains(addr, "/dns4/") {
+			resolved = append(resolved, addr)
+			continue
+		}
+		// Extract domain from /dns4/DOMAIN/...
+		parts := strings.SplitN(addr, "/dns4/", 2)
+		if len(parts) < 2 {
+			resolved = append(resolved, addr)
+			continue
+		}
+		rest := parts[1]
+		domain := strings.SplitN(rest, "/", 2)[0]
+
+		// Try DoH resolution via Google DNS
+		ip := dohResolve(domain)
+		if ip != "" {
+			replaced := strings.Replace(addr, "/dns4/"+domain, "/ip4/"+ip, 1)
+			resolved = append(resolved, replaced)
+		} else {
+			resolved = append(resolved, addr)
+		}
+	}
+	return resolved
+}
+
+// dohResolve queries Google DoH for a domain's A record
+func dohResolve(domain string) string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://dns.google/resolve?name=" + domain + "&type=A")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Answer []struct {
+			Name string `json:"name"`
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&result) != nil {
+		return ""
+	}
+	for _, a := range result.Answer {
+		if a.Type == 1 { // A record
+			return a.Data
+		}
+	}
+	return ""
+}
 //   - TCP + QUIC transports
 //   - Noise encryption
 //   - AutoNAT (detect public address + NAT type)
 //   - DCUtR hole punching
 //   - Circuit relay v2 (for fallback)
 //   - AutoRelay (auto-discover + use relay nodes)
-func NewNode(listenPort int, keyPath string) (*Node, error) {
+func NewNode(listenPort int, keyPath string, customRelays []string, useDoH bool) (*Node, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	privKey, err := loadOrCreateIdentity(keyPath)
@@ -98,9 +174,20 @@ func NewNode(listenPort int, keyPath string) (*Node, error) {
 		return nil, fmt.Errorf("peer ID: %w", err)
 	}
 
+	// Merge public + custom relays
+	allRelayAddrs := make([]string, 0, len(publicRelays)+len(customRelays))
+	allRelayAddrs = append(allRelayAddrs, publicRelays...)
+	allRelayAddrs = append(allRelayAddrs, customRelays...)
+
+	// Optionally resolve via DoH to bypass DNS pollution
+	if useDoH {
+		log.Printf("[P2P] DoH resolution enabled, resolving relay domains...")
+		allRelayAddrs = resolveDoH(allRelayAddrs)
+	}
+
 	// Resolve relay addresses
 	var relayInfos []peer.AddrInfo
-	for _, rs := range publicRelays {
+	for _, rs := range allRelayAddrs {
 		maddr, err := ma.NewMultiaddr(rs)
 		if err != nil {
 			continue
@@ -143,13 +230,14 @@ func NewNode(listenPort int, keyPath string) (*Node, error) {
 	}
 
 	node := &Node{
-		ctx:     ctx,
-		cancel:  cancel,
-		Host:    h,
-		ID:      peerID,
-		peers:   make(map[peer.ID]*PeerState),
-		keyPath: keyPath,
-		natInfo: NatInfo{NATType: "detecting..."},
+		ctx:           ctx,
+		cancel:        cancel,
+		Host:          h,
+		ID:            peerID,
+		peers:         make(map[peer.ID]*PeerState),
+		keyPath:       keyPath,
+		customRelays:  customRelays,
+		natInfo:       NatInfo{NATType: "detecting..."},
 	}
 
 	log.Printf("[P2P] Node started. PeerID: %s", peerID)
@@ -477,8 +565,9 @@ func (n *Node) ReconnectViaRelays(peerIDStr string, name string) {
 		return
 	}
 
-	// Try each public relay sequentially: /<relay>/p2p/<relay-id>/p2p-circuit/p2p/<target>
-	for _, relayAddr := range publicRelays {
+	// Try each relay (public + custom): /<relay>/p2p/<relay-id>/p2p-circuit/p2p/<target>
+	relays := n.allRelays()
+	for _, relayAddr := range relays {
 		// Normalize: strip any existing /p2p-circuit suffix (defensive)
 		clean := strings.Split(relayAddr, "/p2p-circuit")[0]
 		circuitStr := clean + "/p2p-circuit/p2p/" + peerIDStr
@@ -509,7 +598,7 @@ func (n *Node) ReconnectViaRelays(peerIDStr string, name string) {
 		}
 		log.Printf("[P2P] ✗ relay %s failed: %v", strings.Split(relayAddr, "/p2p/")[0], err)
 	}
-	log.Printf("[P2P] ✗ All %d relays failed for %s", len(publicRelays), peerIDStr[:12])
+	log.Printf("[P2P] ✗ All %d relays failed for %s", len(relays), peerIDStr[:12])
 	// All relays failed
 	n.mu.Lock()
 	if ps, ok := n.peers[pid]; ok {

@@ -162,12 +162,24 @@ export function SetAskSaveLocation(arg1) {
   return window['go']['main']['App']['SetAskSaveLocation'](arg1);
 }
 
+export function SetCustomRelays(arg1) {
+  return window['go']['main']['App']['SetCustomRelays'](arg1);
+}
+
 export function SetDisplayName(arg1) {
   return window['go']['main']['App']['SetDisplayName'](arg1);
 }
 
 export function SetDownloadDir(arg1) {
   return window['go']['main']['App']['SetDownloadDir'](arg1);
+}
+
+export function SetTransportMode(arg1) {
+  return window['go']['main']['App']['SetTransportMode'](arg1);
+}
+
+export function SetUseDoH(arg1) {
+  return window['go']['main']['App']['SetUseDoH'](arg1);
 }
 
 export function ShareFile(arg1, arg2, arg3) {

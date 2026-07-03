@@ -39,6 +39,9 @@ type App struct {
 	paired         []PairedPeer
 	manualDevices  []models.Device
 	knownDevices   []models.Device
+	customRelays   []string
+	useDoH         bool
+	transportMode  string // "auto" (default) or "lan-only"
 	homeDir        string
 	downloadDir    string
 	askSaveLocation bool
@@ -46,7 +49,9 @@ type App struct {
 
 // NewApp creates a new App
 func NewApp() *App {
-	return &App{}
+	return &App{
+		transportMode: "auto",
+	}
 }
 
 // startup is called when the app starts
@@ -66,12 +71,16 @@ func (a *App) startup(ctx context.Context) {
 	a.loadManualDevices()
 	a.loadKnownDevices()
 
-	// Auto-start P2P in background (non-blocking)
-	go func() {
-		if err := a.startP2PInBackground(); err != nil {
-			runtime.LogErrorf(a.ctx, "Auto P2P start failed: %v", err)
-		}
-	}()
+	// Auto-start P2P in background (non-blocking), unless lan-only mode
+	if a.transportMode != "lan-only" {
+		go func() {
+			if err := a.startP2PInBackground(); err != nil {
+				runtime.LogErrorf(a.ctx, "Auto P2P start failed: %v", err)
+			}
+		}()
+	} else {
+		runtime.LogInfof(a.ctx, "Transport mode is lan-only, P2P disabled")
+	}
 
 	// Create transfer server
 	a.transferServer = transfer.NewServer(
@@ -130,6 +139,9 @@ func (a *App) shutdown(_ context.Context) {
 // GetDevices returns all known devices. Online status is determined live from
 // current discovery/P2P/manual lists, but offline devices are still shown
 // (they were connected before and are persisted).
+//
+// Dedup: when the same physical machine is reachable via both LAN and P2P,
+// the entries are merged into one (LAN-preferred) to avoid duplicates.
 func (a *App) GetDevices() []models.Device {
 	// Build a set of currently-online devices keyed by ID
 	liveOnline := map[string]models.Device{}
@@ -164,9 +176,76 @@ func (a *App) GetDevices() []models.Device {
 			offline = append(offline, d)
 		}
 	}
+
+	// Dedup: merge online devices that share the same P2PID or same IP.
+	// When both a LAN entry and a P2P entry exist for the same machine,
+	// merge into a single LAN-preferred entry (keep LAN IP for direct connect).
+	online = dedupDevices(online)
+
 	result = append(result, online...)
 	result = append(result, offline...)
 	return result
+}
+
+// dedupDevices merges devices that represent the same physical machine.
+// Match criteria (in order): same non-empty P2PID, or same IP (both online).
+// LAN entries are preferred; P2P entries contribute their PeerID as P2PID.
+func dedupDevices(devices []models.Device) []models.Device {
+	if len(devices) <= 1 {
+		return devices
+	}
+
+	// First pass: build a map from P2PID → index (for LAN devices that broadcast P2PID)
+	p2pIndex := map[string]int{} // P2PID → index in devices
+	for i, d := range devices {
+		if d.P2PID != "" {
+			p2pIndex[d.P2PID] = i
+		}
+	}
+
+	merged := make([]models.Device, 0, len(devices))
+	skip := make([]bool, len(devices))
+
+	for i, d := range devices {
+		if skip[i] {
+			continue
+		}
+
+		// If this is a P2P device (source="p2p"), check if a LAN device with
+		// matching P2PID already exists. If so, skip this P2P entry.
+		if d.Source == "p2p" {
+			// Match by ID: a LAN device may have set its P2PID to this P2P device's ID
+			if lanIdx, ok := p2pIndex[d.ID]; ok && lanIdx != i && devices[lanIdx].Source != "p2p" {
+				// Merge: ensure LAN entry has P2PID populated
+				if devices[lanIdx].P2PID == "" {
+					devices[lanIdx].P2PID = d.ID
+				}
+				skip[i] = true
+				continue
+			}
+		}
+
+		// If this is a LAN device, check for another device with same IP that
+		// is also online. P2P devices that don't carry P2PID are matched by IP.
+		if d.Source == "lan" && d.IP != "" {
+			for j := i + 1; j < len(devices); j++ {
+				if skip[j] {
+					continue
+				}
+				if devices[j].IP == d.IP && devices[j].Source == "p2p" {
+					// Merge P2P info into LAN entry
+					if d.P2PID == "" {
+						d.P2PID = devices[j].ID
+					}
+					skip[j] = true
+				}
+			}
+		}
+
+		merged = append(merged, d)
+	}
+
+	return merged
 }
 
 // syncKnownDevices merges live device info into the persisted knownDevices list
@@ -337,7 +416,7 @@ func (a *App) startP2PInBackground() error {
 
 	go func() {
 		keyPath := filepath.Join(a.homeDir, ".lanlink", "p2p_key")
-		node, err := p2p.NewNode(p2pPort, keyPath)
+		node, err := p2p.NewNode(p2pPort, keyPath, a.customRelays, a.useDoH)
 		if err != nil {
 			errCh <- err
 			return
@@ -384,6 +463,10 @@ func (a *App) startP2PInBackground() error {
 	)
 
 	a.p2pNode = node
+	// Share P2P PeerID via LAN discovery so other devices can dedup LAN+P2P entries
+	if a.discovery != nil {
+		a.discovery.SetP2PID(node.FullPeerID())
+	}
 	runtime.LogInfof(a.ctx, "P2P auto-started. PeerID: %s", node.FullPeerID())
 	runtime.EventsEmit(a.ctx, "p2p-started", node.FullPeerID())
 	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
@@ -641,12 +724,14 @@ func (a *App) GoOnline() {
 		runtime.LogErrorf(a.ctx, "Failed to restart discovery: %v", err)
 	}
 
-	// Restart P2P (p2pStarted was reset to false in GoOffline)
-	go func() {
-		if err := a.startP2PInBackground(); err != nil {
-			runtime.LogErrorf(a.ctx, "Failed to restart P2P: %v", err)
-		}
-	}()
+	// Restart P2P (p2pStarted was reset to false in GoOffline), unless lan-only
+	if a.transportMode != "lan-only" {
+		go func() {
+			if err := a.startP2PInBackground(); err != nil {
+				runtime.LogErrorf(a.ctx, "Failed to restart P2P: %v", err)
+			}
+		}()
+	}
 
 	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
 	runtime.EventsEmit(a.ctx, "online-status-changed", true)

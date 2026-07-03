@@ -84,9 +84,15 @@ export function SendP2PMessage(arg1:string,arg2:string):Promise<models.Message>;
 
 export function SetAskSaveLocation(arg1:boolean):Promise<void>;
 
+export function SetCustomRelays(arg1:Array<string>):Promise<void>;
+
 export function SetDisplayName(arg1:string):Promise<void>;
 
 export function SetDownloadDir(arg1:string):Promise<string>;
+
+export function SetTransportMode(arg1:string):Promise<void>;
+
+export function SetUseDoH(arg1:boolean):Promise<void>;
 
 export function ShareFile(arg1:string,arg2:string,arg3:string):Promise<models.SharedFile>;
 

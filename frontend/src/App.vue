@@ -10,7 +10,8 @@ import {
   SendGroupMessage, ShareFile, ShareFilePath, ShareGroupFile, ShareGroupFilePath,
   DownloadSharedFile, GetGroups,
   GoOffline, GoOnline, IsOnline, GetSettings, ChooseDownloadDir, OpenFileInFolder,
-  OpenFile, SetAskSaveLocation, SetDisplayName, RemoveKnownDevice
+  OpenFile, SetAskSaveLocation, SetDisplayName, RemoveKnownDevice,
+  SetCustomRelays, SetUseDoH, SetTransportMode
 } from '../wailsjs/go/main/App'
 
 import { models } from '../wailsjs/go/models'
@@ -53,6 +54,9 @@ const showSettings = ref(false)
 const settingsDownloadDir = ref('')
 const settingsAskSave = ref(false)
 const settingsDeviceName = ref('')
+const settingsRelays = ref('')
+const settingsDoH = ref(false)
+const settingsTransportMode = ref('auto')
 const downloadResult = ref<{ name: string; path: string } | null>(null)
 const showConnectModal = ref(false)
 const p2pConnectInput = ref('')
@@ -289,6 +293,9 @@ async function openSettings() {
     settingsDownloadDir.value = s.downloadDir || ''
     settingsAskSave.value = s.askSaveLocation || false
     settingsDeviceName.value = localDevice.value?.name || ''
+    settingsRelays.value = (s.customRelays || []).join('\n')
+    settingsDoH.value = s.useDoH || false
+    settingsTransportMode.value = s.transportMode || 'auto'
     showSettings.value = true
   } catch (e) { console.error(e) }
 }
@@ -301,9 +308,27 @@ async function saveDeviceName() {
   showNotification(t('settings.deviceNameSaved'))
 }
 
+async function saveRelays() {
+  const lines = settingsRelays.value.split('\n').map(s => s.trim()).filter(s => s.length > 0)
+  await SetCustomRelays(lines)
+  showNotification(t('settings.relaysSaved'))
+}
+
+async function toggleDoH() {
+  settingsDoH.value = !settingsDoH.value
+  await SetUseDoH(settingsDoH.value)
+}
+
 async function toggleAskSave() {
   settingsAskSave.value = !settingsAskSave.value
   await SetAskSaveLocation(settingsAskSave.value)
+}
+
+async function setTransportMode(mode: string) {
+  settingsTransportMode.value = mode
+  await SetTransportMode(mode)
+  await refreshP2PStatus()
+  showNotification(t('settings.transportModeRestart'))
 }
 
 async function chooseDownloadDir() {
@@ -636,6 +661,34 @@ onUnmounted(() => {})
             <span class="toggle-knob"></span>
           </span>
         </div>
+        <div class="setting-row toggle-row" @click="toggleDoH">
+          <span class="setting-label">{{ t('settings.doh') }}</span>
+          <span class="toggle-switch" :class="{ on: settingsDoH }">
+            <span class="toggle-knob"></span>
+          </span>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">🔀 {{ t('settings.transportMode') }}</div>
+          <div class="setting-hint">{{ t('settings.transportModeHint') }}</div>
+          <div class="transport-options">
+            <label class="transport-option" :class="{ active: settingsTransportMode === 'auto' }" @click="setTransportMode('auto')">
+              <input type="radio" name="transportMode" value="auto" :checked="settingsTransportMode === 'auto'" />
+              <div class="transport-label">{{ t('settings.transportModeAuto') }}</div>
+              <div class="transport-desc">{{ t('settings.transportModeAutoDesc') }}</div>
+            </label>
+            <label class="transport-option" :class="{ active: settingsTransportMode === 'lan-only' }" @click="setTransportMode('lan-only')">
+              <input type="radio" name="transportMode" value="lan-only" :checked="settingsTransportMode === 'lan-only'" />
+              <div class="transport-label">{{ t('settings.transportModeLanOnly') }}</div>
+              <div class="transport-desc">{{ t('settings.transportModeLanOnlyDesc') }}</div>
+            </label>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">{{ t('settings.relays') }}</div>
+          <div class="setting-hint">{{ t('settings.relaysHint') }}</div>
+          <textarea v-model="settingsRelays" class="setting-textarea" rows="3" :placeholder="'/' + t('settings.relaysPlaceholder')"></textarea>
+          <button class="btn-confirm" style="margin-top:6px" @click="saveRelays">{{ t('settings.save') }}</button>
+        </div>
         <div class="modal-btns">
           <button class="btn-confirm" @click="showSettings = false">OK</button>
         </div>
@@ -757,6 +810,7 @@ onUnmounted(() => {})
 .setting-hint { font-size: 11px; color: var(--text-secondary); margin-bottom: 8px; }
 .setting-input-row { display: flex; gap: 8px; }
 .setting-input { flex: 1; font-size: 12px; font-family: monospace; padding: 6px 10px; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); }
+.setting-textarea { width: 100%; font-size: 11px; font-family: monospace; padding: 6px 10px; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 4px; color: var(--text-primary); resize: vertical; box-sizing: border-box; margin-top: 4px; }
 
 .download-path-box {
   background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px;
@@ -776,10 +830,21 @@ onUnmounted(() => {})
 .connect-modal .name-input { max-width: 100px; flex: 0 0 100px; }
 
 .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; cursor: pointer; border-top: 1px solid var(--border); }
-.toggle-row:hover { background: var(--bg-hover); margin: 0 -24px; padding: 10px 24px; }
+.toggle-row:hover { background: var(--bg-hover); }
 .toggle-switch { width: 36px; height: 20px; background: var(--bg-primary); border-radius: 10px; position: relative; transition: background 0.2s; border: 1px solid var(--border); flex-shrink: 0; }
 .toggle-switch.on { background: var(--success); border-color: var(--success); }
 .toggle-knob { position: absolute; top: 1px; left: 1px; width: 16px; height: 16px; background: #fff; border-radius: 50%; transition: left 0.2s; }
 .toggle-switch.on .toggle-knob { left: 17px; }
+.transport-options { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.transport-option {
+  display: flex; flex-direction: column; padding: 8px 10px;
+  background: var(--bg-primary); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer; transition: all 0.15s;
+}
+.transport-option:hover { border-color: var(--accent); }
+.transport-option.active { border-color: var(--accent); background: rgba(88,166,255,0.08); }
+.transport-option input[type="radio"] { display: none; }
+.transport-label { font-size: 12px; font-weight: 600; }
+.transport-desc { font-size: 10px; color: var(--text-secondary); margin-top: 2px; }
 @keyframes toast-in { from { opacity: 0; transform: translateX(-50%) translateY(-10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
 </style>

@@ -12,6 +12,7 @@ type Device struct {
 	Online   bool      `json:"online"`
 	Source   string    `json:"source"` // "lan" or "p2p"
 	Groups   []string  `json:"groups"` // group IDs this device belongs to
+	P2PID    string    `json:"p2pId,omitempty"` // libp2p PeerID, used to dedup LAN+P2P entries
 }
 
 // DiscoveryPacket is broadcast via UDP for device discovery
@@ -21,6 +22,7 @@ type DiscoveryPacket struct {
 	IP       string   `json:"ip"`
 	Port     int      `json:"port"`
 	GroupIDs []string `json:"groupIds,omitempty"` // groups this device is in
+	P2PID    string   `json:"p2pId,omitempty"`    // libp2p PeerID for dedup across LAN/P2P
 }
 
 // TransferRecord stores history of file transfers

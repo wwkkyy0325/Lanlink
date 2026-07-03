@@ -172,12 +172,74 @@ func getPrimaryMAC() string {
 }
 
 func getLocalIPForMAC() string {
+	// Prefer a real LAN IP over VPN virtual IPs for MAC matching.
+	if ip := pickBestLANIP(); ip != "" {
+		return ip
+	}
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return ""
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// pickBestLANIP returns the best LAN IPv4 address, skipping VPN/virtual adapters.
+func pickBestLANIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	var best string
+	bestScore := -1
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		name := strings.ToLower(iface.Name)
+		if isVirtual(name) {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLoopback() {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			score := 0
+			if ip4[0] == 192 && ip4[1] == 168 {
+				score = 100
+			} else if ip4[0] == 10 {
+				score = 90
+			} else if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+				score = 80
+			} else if ip4[0] == 169 && ip4[1] == 254 {
+				score = -50
+			}
+			if score > bestScore {
+				bestScore = score
+				best = ip4.String()
+			}
+		}
+	}
+	return best
+}
+
+func isVirtual(name string) bool {
+	for _, kw := range []string{
+		"vmware", "virtualbox", "vbox", "vpn", "tap", "tunnel",
+		"pseudo", "docker", "wsl", "hyper-v", "bluetooth",
+		"utun", "vmnet", "bridge", "gif", "stf", "awdl", "llw",
+		"veth", "virbr", "tun", "radmin", "wireguard", "wg",
+		"zerotier", "zt", "tailscale", "ts", "hamachi",
+		"ppp", "pptp", "l2tp", "sstp", "openvpn", "nordlynx",
+	} {
+		if strings.Contains(name, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 func generateFallbackID() string {
@@ -250,8 +312,11 @@ func (a *App) saveChatData() {
 
 // settings.json
 type AppSettings struct {
-	DownloadDir     string `json:"downloadDir"`
-	AskSaveLocation bool   `json:"askSaveLocation"`
+	DownloadDir     string   `json:"downloadDir"`
+	AskSaveLocation bool     `json:"askSaveLocation"`
+	CustomRelays    []string `json:"customRelays"`    // user-configured relay nodes
+	UseDoH          bool     `json:"useDoH"`          // try DNS-over-HTTPS to bypass pollution
+	TransportMode   string   `json:"transportMode"`   // "auto" (default) or "lan-only"
 }
 
 func (a *App) settingsPath() string {
@@ -269,18 +334,59 @@ func (a *App) loadSettings() {
 			a.downloadDir = s.DownloadDir
 		}
 		a.askSaveLocation = s.AskSaveLocation
+		a.customRelays = s.CustomRelays
+		a.useDoH = s.UseDoH
+		if s.TransportMode != "" {
+			a.transportMode = s.TransportMode
+		}
 	}
 }
 
 func (a *App) saveSettings() {
-	s := AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation}
+	s := AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation, CustomRelays: a.customRelays, UseDoH: a.useDoH, TransportMode: a.transportMode}
 	data, _ := json.MarshalIndent(s, "", "  ")
 	os.WriteFile(a.settingsPath(), data, 0600)
 }
 
 // GetSettings returns current app settings
 func (a *App) GetSettings() AppSettings {
-	return AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation}
+	return AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation, CustomRelays: a.customRelays, UseDoH: a.useDoH, TransportMode: a.transportMode}
+}
+
+// SetCustomRelays updates user-configured relay nodes
+func (a *App) SetCustomRelays(relays []string) {
+	a.customRelays = relays
+	a.saveSettings()
+}
+
+// SetUseDoH toggles DNS-over-HTTPS
+func (a *App) SetUseDoH(on bool) {
+	a.useDoH = on
+	a.saveSettings()
+}
+
+// SetTransportMode sets the transport mode ("auto" or "lan-only")
+func (a *App) SetTransportMode(mode string) {
+	if mode != "auto" && mode != "lan-only" {
+		return
+	}
+	a.transportMode = mode
+	a.saveSettings()
+
+	// Apply immediately: stop P2P if switching to lan-only
+	if mode == "lan-only" {
+		a.StopP2P()
+	} else if mode == "auto" {
+		// Start P2P if not already running
+		if a.p2pNode == nil {
+			go func() {
+				if err := a.startP2PInBackground(); err != nil {
+					runtime.LogErrorf(a.ctx, "Transport mode switch P2P start failed: %v", err)
+				}
+			}()
+		}
+	}
+	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
 }
 
 // SetAskSaveLocation toggles whether to prompt for save location each download
