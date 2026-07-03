@@ -1,0 +1,9 @@
+build/bin
+node_modules
+frontend/dist
+*.exe
+*.bak
+lanlink-dev.log
+.DS_Store
+.idea
+.vscode

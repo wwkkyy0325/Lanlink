@@ -1,0 +1,3 @@
+@echo off
+echo Starting Lanlink...
+start "" "%~dp0build\bin\lanlink.exe"

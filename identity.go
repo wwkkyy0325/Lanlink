@@ -1,0 +1,439 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"lanlink/models"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// IdentityConfig stores persistent device identity
+type IdentityConfig struct {
+	DeviceID    string `json:"deviceId"`
+	DisplayName string `json:"displayName"`
+	Created     string `json:"created"`
+}
+
+// ChatStore holds all persisted chat data
+type ChatStore struct {
+	Messages  []models.Message        `json:"messages"`
+	History   []models.TransferRecord `json:"history"`
+	Groups    []models.Group          `json:"groups"`
+	Paired    []PairedPeer            `json:"paired"`
+	Updated   string                  `json:"updated"`
+}
+
+// PairedPeer stores a previously connected peer for auto-reconnect
+type PairedPeer struct {
+	PeerID string `json:"peerId"`
+	Name   string `json:"name"`
+}
+
+func (a *App) pairedPath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "paired.json")
+}
+
+// addPairedPeer persists a peer for auto-reconnect (dedup by PeerID)
+func (a *App) addPairedPeer(peerID string, name string) {
+	if peerID == "" {
+		return
+	}
+	exists := false
+	for i := range a.paired {
+		if a.paired[i].PeerID == peerID {
+			a.paired[i].Name = name
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		a.paired = append(a.paired, PairedPeer{PeerID: peerID, Name: name})
+	}
+	a.savePaired()
+}
+
+func (a *App) savePaired() {
+	data, _ := json.MarshalIndent(a.paired, "", "  ")
+	os.WriteFile(a.pairedPath(), data, 0600)
+}
+
+func (a *App) loadPaired() {
+	data, err := os.ReadFile(a.pairedPath())
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &a.paired)
+}
+
+func (a *App) identityPath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "identity.json")
+}
+
+func (a *App) chatStorePath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "chat_data.json")
+}
+
+// loadOrCreateIdentity loads saved identity or derives one from the MAC address.
+// The MAC address is used as the stable device ID (doesn't change across reinstalls).
+func (a *App) loadOrCreateIdentity() {
+	ipath := a.identityPath()
+	os.MkdirAll(filepath.Dir(ipath), 0700)
+
+	// MAC address is the source of truth for identity
+	mac := getPrimaryMAC()
+	if mac == "" {
+		mac = generateFallbackID() // only if no NIC has a MAC (extremely rare)
+	}
+	a.deviceID = mac
+
+	// Load saved display name if present
+	if data, err := os.ReadFile(ipath); err == nil {
+		var cfg IdentityConfig
+		if json.Unmarshal(data, &cfg) == nil && cfg.DisplayName != "" {
+			a.deviceName = cfg.DisplayName
+		}
+	}
+
+	if a.deviceName == "" {
+		a.deviceName, _ = os.Hostname()
+	}
+
+	// Persist (deviceID derived from MAC each launch, but we store for record)
+	cfg := IdentityConfig{
+		DeviceID:    a.deviceID,
+		DisplayName: a.deviceName,
+		Created:     time.Now().Format(time.RFC3339),
+	}
+	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		os.WriteFile(ipath, data, 0600)
+	}
+}
+
+// getPrimaryMAC returns the MAC address of the primary physical network interface.
+// Skips loopback, virtual, and down interfaces. Returns "aa:bb:cc:dd:ee:ff" format.
+func getPrimaryMAC() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	// Heuristic: prefer the interface whose IP matches our primary LAN IP
+	primaryIP := getLocalIPForMAC()
+
+	var best string
+	var bestScore int = -1
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		hw := iface.HardwareAddr.String()
+		if hw == "" || len(iface.HardwareAddr) < 6 {
+			continue
+		}
+
+		score := 0
+		// Skip common virtual adapter name prefixes
+		name := strings.ToLower(iface.Name)
+		for _, v := range []string{"vmware", "virtualbox", "vbox", "vpn", "tap", "tunnel", "pseudo", "docker", "wsl", "hyper-v", "bluetooth", "utun", "vmnet", "bridge", "gif", "stf", "awdl", "llw", "veth", "virbr", "tap", "tun"} {
+			if strings.Contains(name, v) {
+				score -= 10
+			}
+		}
+
+		// Strongly prefer the interface that owns our LAN IP
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				if ipnet.IP.String() == primaryIP {
+					score += 100
+				} else if !ipnet.IP.IsLoopback() {
+					score += 5
+				}
+			}
+		}
+
+		if score > bestScore {
+			bestScore = score
+			best = hw
+		}
+	}
+	return best
+}
+
+func getLocalIPForMAC() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+func generateFallbackID() string {
+	b := make([]byte, 6)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// saveIdentity updates the display name
+func (a *App) saveIdentity() {
+	cfg := IdentityConfig{
+		DeviceID:    a.deviceID,
+		DisplayName: a.deviceName,
+		Created:     time.Now().Format(time.RFC3339),
+	}
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	os.WriteFile(a.identityPath(), data, 0600)
+}
+
+// SetDisplayName allows the user to change their display name
+func (a *App) SetDisplayName(name string) {
+	a.deviceName = name
+	a.saveIdentity()
+	if a.discovery != nil {
+		a.discovery.SetDeviceName(name)
+	}
+	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
+}
+
+// loadChatData loads persisted messages, history, and groups
+func (a *App) loadChatData() {
+	cpath := a.chatStorePath()
+	data, err := os.ReadFile(cpath)
+	if err != nil {
+		return
+	}
+	var store ChatStore
+	if json.Unmarshal(data, &store) != nil {
+		return
+	}
+	if len(store.Messages) > 0 {
+		a.messages = store.Messages
+	}
+	if len(store.History) > 0 {
+		a.history = store.History
+	}
+	if len(store.Groups) > 0 {
+		a.groups = store.Groups
+	}
+}
+
+// saveChatData persists messages, history, and groups to disk
+func (a *App) saveChatData() {
+	store := ChatStore{
+		Messages: a.messages,
+		History:  a.history,
+		Groups:   a.groups,
+		Updated:  time.Now().Format(time.RFC3339),
+	}
+	// Keep max 500 messages and 200 history entries
+	if len(store.Messages) > 500 {
+		store.Messages = store.Messages[len(store.Messages)-500:]
+	}
+	if len(store.History) > 200 {
+		store.History = store.History[len(store.History)-200:]
+	}
+	data, _ := json.MarshalIndent(store, "", "  ")
+	os.WriteFile(a.chatStorePath(), data, 0600)
+}
+
+// settings.json
+type AppSettings struct {
+	DownloadDir     string `json:"downloadDir"`
+	AskSaveLocation bool   `json:"askSaveLocation"`
+}
+
+func (a *App) settingsPath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "settings.json")
+}
+
+func (a *App) loadSettings() {
+	data, err := os.ReadFile(a.settingsPath())
+	if err != nil {
+		return
+	}
+	var s AppSettings
+	if json.Unmarshal(data, &s) == nil {
+		if s.DownloadDir != "" {
+			a.downloadDir = s.DownloadDir
+		}
+		a.askSaveLocation = s.AskSaveLocation
+	}
+}
+
+func (a *App) saveSettings() {
+	s := AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(a.settingsPath(), data, 0600)
+}
+
+// GetSettings returns current app settings
+func (a *App) GetSettings() AppSettings {
+	return AppSettings{DownloadDir: a.downloadDir, AskSaveLocation: a.askSaveLocation}
+}
+
+// SetAskSaveLocation toggles whether to prompt for save location each download
+func (a *App) SetAskSaveLocation(on bool) {
+	a.askSaveLocation = on
+	a.saveSettings()
+}
+
+// ChooseDownloadDir opens a folder picker and returns the chosen path
+func (a *App) ChooseDownloadDir() string {
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "Select Download Folder",
+	})
+	if err != nil || dir == "" {
+		return ""
+	}
+	a.downloadDir = dir
+	os.MkdirAll(dir, 0755)
+	a.saveSettings()
+	return dir
+}
+
+// SetDownloadDir sets the download directory directly
+func (a *App) SetDownloadDir(dir string) string {
+	if dir == "" {
+		return a.downloadDir
+	}
+	a.downloadDir = dir
+	os.MkdirAll(dir, 0755)
+	a.saveSettings()
+	return dir
+}
+
+// ============================================================
+// Manual Devices (for Radmin VPN / manual IP entry)
+// ============================================================
+
+func (a *App) manualDevicesPath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "manual_devices.json")
+}
+
+func (a *App) loadManualDevices() {
+	data, err := os.ReadFile(a.manualDevicesPath())
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &a.manualDevices)
+}
+
+func (a *App) saveManualDevices() {
+	data, _ := json.MarshalIndent(a.manualDevices, "", "  ")
+	os.WriteFile(a.manualDevicesPath(), data, 0600)
+}
+
+// PingDevice tests if a device's transfer server is reachable. Returns "ok" or error.
+func (a *App) PingDevice(ip string) string {
+	url := fmt.Sprintf("http://%s:%d/ping", ip, transferPort)
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "unreachable: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return "ok"
+	}
+	return "HTTP " + resp.Status
+}
+
+// AddDeviceByIP manually adds a device by IP (e.g. a Radmin VPN virtual IP).
+// Pings first; returns the device if reachable, nil otherwise.
+func (a *App) AddDeviceByIP(ip string, name string) *models.Device {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil
+	}
+
+	// Validate reachability
+	if a.PingDevice(ip) != "ok" {
+		return nil
+	}
+
+	if name == "" {
+		name = "Device " + ip
+	}
+
+	dev := models.Device{
+		ID:     "manual-" + ip,
+		Name:   name,
+		IP:     ip,
+		Port:   transferPort,
+		Online: true,
+		Source: "manual",
+	}
+
+	// Dedup by ID
+	for i, d := range a.manualDevices {
+		if d.ID == dev.ID {
+			a.manualDevices[i] = dev
+			a.saveManualDevices()
+			runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
+			return &dev
+		}
+	}
+	a.manualDevices = append(a.manualDevices, dev)
+	a.saveManualDevices()
+	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
+	return &dev
+}
+
+// RemoveManualDevice removes a manually-added device
+func (a *App) RemoveManualDevice(id string) {
+	newList := make([]models.Device, 0)
+	for _, d := range a.manualDevices {
+		if d.ID != id {
+			newList = append(newList, d)
+		}
+	}
+	a.manualDevices = newList
+	a.saveManualDevices()
+	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
+}
+
+// ============================================================
+// Known Devices (persistent device history)
+// ============================================================
+
+func (a *App) knownDevicesPath() string {
+	return filepath.Join(a.homeDir, ".lanlink", "known_devices.json")
+}
+
+func (a *App) loadKnownDevices() {
+	data, err := os.ReadFile(a.knownDevicesPath())
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &a.knownDevices)
+}
+
+func (a *App) saveKnownDevices() {
+	data, _ := json.MarshalIndent(a.knownDevices, "", "  ")
+	os.WriteFile(a.knownDevicesPath(), data, 0600)
+}
+
+// RemoveKnownDevice removes a device from the known devices list
+func (a *App) RemoveKnownDevice(id string) {
+	newList := make([]models.Device, 0)
+	for _, d := range a.knownDevices {
+		if d.ID != id {
+			newList = append(newList, d)
+		}
+	}
+	a.knownDevices = newList
+	a.saveKnownDevices()
+	runtime.EventsEmit(a.ctx, "devices-changed", a.GetDevices())
+}
