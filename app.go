@@ -184,6 +184,26 @@ func (a *App) GetDevices() []models.Device {
 
 	result = append(result, online...)
 	result = append(result, offline...)
+
+	// Strip any device that belongs to this machine (same IP as local device)
+	// but somehow escaped the ID-based filter above.
+	// This can happen when the MAC-derived device ID changed (e.g. fallback
+	// from random → hostname) and known_devices.json still has the old ID.
+	localIP := ""
+	if a.discovery != nil {
+		localIP = discovery.GetLocalIP()
+	}
+	if localIP != "" {
+		filtered := result[:1] // keep local device at index 0
+		for _, d := range result[1:] {
+			if d.IP == localIP {
+				continue // same machine, skip
+			}
+			filtered = append(filtered, d)
+		}
+		result = filtered
+	}
+
 	return result
 }
 

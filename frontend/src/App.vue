@@ -434,9 +434,21 @@ onMounted(async () => {
   await refreshP2PStatus()
 
   EventsOn('devices-changed', async (newDevices: Device[]) => {
-    if (localDevice.value) {
-      devices.value = [localDevice.value, ...newDevices.filter(d => d.id !== localDevice.value!.id)]
-    } else { devices.value = newDevices }
+    // Eagerly fetch local device if not yet loaded (handles race condition
+    // where event fires before GetLocalDevice() resolves in refreshDevices).
+    if (!localDevice.value) {
+      localDevice.value = await GetLocalDevice()
+    }
+    const localId = localDevice.value?.id ?? ''
+    const localIp = localDevice.value?.ip ?? ''
+    // Filter: skip own ID AND any device with our IP (catches old known_devices
+    // entries from previous runs with a different device ID).
+    devices.value = [
+      localDevice.value,
+      ...newDevices.filter(d =>
+        d.id !== localId && d.ip !== localIp
+      )
+    ]
   })
 
   EventsOn('file-received', (record: TransferRecord) => {
